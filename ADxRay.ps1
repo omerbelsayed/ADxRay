@@ -129,7 +129,7 @@ function Hammer
 
                 Write-Progress -activity 'Running Inventories' -Status "5% Complete." -CurrentOperation 'Triggering Domain Inventory..'
 
-                $Global:SecGroups = @('Domain Admins','Schema Admins','Enterprise Admins','Server Operators','Account Operators','Administrators','Backup Operators','Print Operators','Domain Controllers','Read-only Domain Controllers','Group Policy Creator Owners','Cryptographic Operators','Distributed COM Users')
+                $Global:SecGroups = @('Domain Admins','Schema Admins','Enterprise Admins','Server Operators','Account Operators','Administrators','Backup Operators','Print Operators','Domain Controllers','Read-only Domain Controllers','Group Policy Creator Owners','Cryptographic Operators','Distributed COM Users','Protected Users')
 
                 Foreach ($zone in $Forest.ApplicationPartitions.Name)
                     {
@@ -161,6 +161,22 @@ function Hammer
                         start-job -Name ($Domain.name+'_Comps') -scriptblock {dsquery * -filter sAMAccountType=805306369 -s $($args) -Attr OperatingSystem  -limit 0} -ArgumentList $Domain.PdcRoleOwner.Name  | Out-Null
 
                         start-job -Name ($Domain.name+'_GrpAll') -scriptblock {ForEach($grp in $($args[1])) {@{$grp = ((dsquery * -filter "(&(objectclass=group)(name=$grp))" -s $($args[0]) -attr member -limit 0).split(";") | Where-Object {$_ -like '*DC*'}).count}}} -ArgumentList $Domain.PdcRoleOwner.Name,$SecGroups  | Out-Null
+
+                        Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Starting Kerberoastable Accounts Check")
+
+                        start-job -Name ($Domain.Name+'_Kerberoastable') -scriptblock {Get-ADUser -Server $($args) -LDAPFilter '(&(objectCategory=person)(objectClass=user)(servicePrincipalName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=krbtgt)))' -Properties ServicePrincipalName,PasswordLastSet,msDS-SupportedEncryptionTypes -ErrorAction SilentlyContinue | Select-Object SamAccountName,PasswordLastSet,ServicePrincipalName,@{Name='SupportedEncryptionTypes';Expression={$_.'msDS-SupportedEncryptionTypes'}}} -ArgumentList $Domain.PdcRoleOwner.Name | Out-Null
+
+                        Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Starting AdminSDHolder Orphaned Accounts Check")
+
+                        start-job -Name ($Domain.Name+'_AdminSDHolder') -scriptblock {Get-ADUser -Server $($args) -LDAPFilter '(&(adminCount=1)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(sAMAccountName=Administrator))(!(sAMAccountName=krbtgt)))' -Properties MemberOf -ErrorAction SilentlyContinue | Select-Object SamAccountName,MemberOf} -ArgumentList $Domain.PdcRoleOwner.Name | Out-Null
+
+                        Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Starting Unconstrained Delegation Computers Check")
+
+                        start-job -Name ($Domain.Name+'_UnconDeleg') -scriptblock {Get-ADComputer -Server $($args) -LDAPFilter '(&(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(primaryGroupID=516))(!(primaryGroupID=521)))' -ErrorAction SilentlyContinue | Select-Object SamAccountName} -ArgumentList $Domain.PdcRoleOwner.Name | Out-Null
+
+                        Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Starting KRBTGT Password Age Check")
+
+                        start-job -Name ($Domain.Name+'_Krbtgt') -scriptblock {Get-ADUser -Identity krbtgt -Server $($args) -Properties PasswordLastSet -ErrorAction SilentlyContinue | Select-Object PasswordLastSet} -ArgumentList $Domain.PdcRoleOwner.Name | Out-Null
 
                 }
 
@@ -196,6 +212,8 @@ function Hammer
 
                     $Feature = ([PowerShell]::Create()).AddScript({param($DomControl)Invoke-Command -cn $DomControl -ScriptBlock {Get-SmbServerConfiguration | Select EnableSMB1Protocol}}).AddArgument($($args[0]))
 
+                    $LdapSecurity = ([PowerShell]::Create()).AddScript({param($DomControl)Invoke-Command -cn $DomControl -ScriptBlock {Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' -ErrorAction SilentlyContinue | Select-Object LDAPServerIntegrity,LdapEnforceChannelBinding}}).AddArgument($($args[0]))
+
                     $HW = ([PowerShell]::Create()).AddScript({param($DomControl)Invoke-Command -cn $DomControl -ScriptBlock {systeminfo /fo CSV | ConvertFrom-Csv}}).AddArgument($($args[0]))
 
                     $HWBkp = ([PowerShell]::Create()).AddScript({param($DomControl)systeminfo /S $DomControl /fo CSV | ConvertFrom-Csv}).AddArgument($($args[0]))
@@ -224,6 +242,7 @@ function Hammer
                     $jobSW64 = $Software64.BeginInvoke()
                     $jobSW86 = $Software86.BeginInvoke()
                     $jobFeature = $Feature.BeginInvoke()
+                    $jobLdapSecurity = $LdapSecurity.BeginInvoke()
                     $jobHW = $HW.BeginInvoke()
                     $jobHWBkp = $HWBkp.BeginInvoke()
                     $jobBackup = $Backup.BeginInvoke()
@@ -241,6 +260,7 @@ function Hammer
                     $job += $jobSW64
                     $job += $jobSW86
                     $job += $jobFeature
+                    $job += $jobLdapSecurity
                     $job += $jobHW
                     $job += $jobHWBkp
                     $job += $jobBackup
@@ -260,6 +280,7 @@ function Hammer
                     $SW64S = $Software64.EndInvoke($jobSW64)
                     $SW86S = $Software86.EndInvoke($jobSW86)
                     $FeatureS = $Feature.EndInvoke($jobFeature)
+                    $LdapSecurityS = $LdapSecurity.EndInvoke($jobLdapSecurity)
                     $HWS = $HW.EndInvoke($jobHW)
                     $HWSBkp = $HWBkp.EndInvoke($jobHWBkp)
                     $BackupS = $Backup.EndInvoke($jobBackup)
@@ -276,6 +297,7 @@ function Hammer
                     $Software64.Dispose()
                     $Software86.Dispose()
                     $Feature.Dispose()
+                    $LdapSecurity.Dispose()
                     $HW.Dispose()
                     $HWBkp.Dispose()
                     $Backup.Dispose()
@@ -294,6 +316,7 @@ function Hammer
                                     'Software_64' = $SW64S;
                                     'Software_86' = $SW86S;
                                     'Installed_Features' = $FeatureS;
+                                    'LdapSecurity' = $LdapSecurityS;
                                     'Hardware' = $HWS;
                                     'HardwareBkp' = $HWSBkp;
                                     'Backup' = $BackupS;
@@ -411,6 +434,10 @@ function Hammer
                         $Comps = Receive-Job -Name ($Domain.name+'_Comps') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                         $GrpAll = Receive-Job -Name ($Domain.name+'_GrpAll') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                         $GPOALL = Receive-Job -Name ($Domain.name+'_GPOs') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                        $Kerberoastable = Receive-Job -Name ($Domain.Name+'_Kerberoastable') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                        $AdminSDHolderOrphans = Receive-Job -Name ($Domain.Name+'_AdminSDHolder') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                        $UnconstrainedDelegComputers = Receive-Job -Name ($Domain.Name+'_UnconDeleg') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                        $Krbtgt = Receive-Job -Name ($Domain.Name+'_Krbtgt') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 
                         Start-job -Name ($Domain.Name+'_job') -ScriptBlock {                            
                             if((test-path ('C:\ADxRay\Hammer\Domain_'+$($args[0]).Name+'.xml')) -eq $true -and $($args[9]) -ne 2) 
@@ -425,6 +452,10 @@ function Hammer
                             $GrpAll = $($args[6])
                             $GPOALL = $($args[7])
                             $RODC = $($args[8])
+                            $Kerberoastable = $($args[10])
+                            $AdminSDHolderOrphans = $($args[11])
+                            $UnconstrainedDelegComputers = $($args[12])
+                            $Krbtgt = $($args[13])
 
                             $att = @()
                             foreach ($UAC in $Usrs)
@@ -445,13 +476,17 @@ function Hammer
                                     'Users' = $att | Group-Object;
                                     'RODC' = $RODC.HostName;
                                     'Computers' = $Comps;
-                                    'AdminGroups'=$GrpAll | Where-Object {$_.Keys -in ('Domain Admins','Schema Admins','Enterprise Admins','Server Operators','Account Operators','Administrators','Backup Operators','Print Operators','Domain Controllers','Read-only Domain Controllers','Group Policy Creator Owners','Cryptographic Operators','Distributed COM Users')};
+                                    'AdminGroups'=$GrpAll | Where-Object {$_.Keys -in ('Domain Admins','Schema Admins','Enterprise Admins','Server Operators','Account Operators','Administrators','Backup Operators','Print Operators','Domain Controllers','Read-only Domain Controllers','Group Policy Creator Owners','Cryptographic Operators','Distributed COM Users','Protected Users')};
                                     'Groups'=$GrpAll | Sort-Object Values,Keys -desc | Select-Object -First 10;
-                                    'SmallGroups' = ($GrpAll | Sort-Object Values | Group-Object Values | Select-Object -Index 0,1 | Measure-Object -Property Count -Sum).Sum
+                                    'SmallGroups' = ($GrpAll | Sort-Object Values | Group-Object Values | Select-Object -Index 0,1 | Measure-Object -Property Count -Sum).Sum;
+                                    'Kerberoastable' = $Kerberoastable;
+                                    'AdminSDHolderOrphans' = $AdminSDHolderOrphans;
+                                    'UnconstrainedDelegationComputers' = $UnconstrainedDelegComputers;
+                                    'KrbtgtPasswordLastSet' = $Krbtgt.PasswordLastSet
                                 }
 
                             $DomainTable | Export-Clixml -Path ('C:\ADxRay\Hammer\Domain_'+$($args[0]).Name+'.xml')
-                        } -ArgumentList $Domain,$Forest.domains,$InvDom,$SysVolDom,$Usrs,$Comps,$GrpAll,$GPOALL,$InvRODC,$Global:Option
+                        } -ArgumentList $Domain,$Forest.domains,$InvDom,$SysVolDom,$Usrs,$Comps,$GrpAll,$GPOALL,$InvRODC,$Global:Option,$Kerberoastable,$AdminSDHolderOrphans,$UnconstrainedDelegComputers,$Krbtgt
                     }
             }
 
@@ -502,6 +537,7 @@ function Hammer
                                     'ldapRR' = $Inv1.ldapRR;
                                     'DCDiag' = $($args[2]) | Select-String -Pattern ($($args[0]).Name.Split('.')[0]);
                                     'InstalledFeatures' = $Inv1.Installed_Features;
+                                    'LdapSecurity' = $Inv1.LdapSecurity;
                                     'InstalledSoftwaresx64' = $Inv1.Software_64 | Where-Object {$_.DisplayName} | Select-Object DisplayName, DisplayVersion, Publisher;
                                     'InstalledSoftwaresx86' = $Inv1.Software_86 | Where-Object {$_.DisplayName} | Select-Object DisplayName, DisplayVersion, Publisher
                                 }
@@ -1309,8 +1345,10 @@ Add-Content $report "                       <th width='10%' align='center'>Disab
 Add-Content $report "                       <th width='10%' align='center' title='Storing encrypted passwords in a way that is reversible means that the encrypted passwords can be decrypted. A knowledgeable attacker who is able to break this encryption can then sign in to network resources by using the compromised account.'>Reversible Encryption</th>" 
 Add-Content $report "                       <th width='10%' align='center' title='As the name suggests, this flag allows you to have a fully functioning account with a blank password (even with a valid domain password policy in place).'>Password Not Required</th>" 
 Add-Content $report "                       <th width='10%' align='center' title='Current research strongly indicates that mandated password changes do more harm than good. They drive users to choose weaker passwords, re-use passwords, or update old passwords in ways that are easily guessed by hackers. Microsoft recommend enabling multi-factor authentication.'>Password Never Expires</th>"
-Add-Content $report "                       <th width='10%' align='center' title='DES encryption uses a 56-bit key to encrypt the content and is now considered to be highly insecure. Hence, accounts that can use DES to authenticate to services are at significantly greater risk of having that account’s logon sequence decrypted and the account compromised.'>Use Kerberos DES</th>" 
-Add-Content $report "                   </tr>" 
+Add-Content $report "                       <th width='10%' align='center' title='DES encryption uses a 56-bit key to encrypt the content and is now considered to be highly insecure. Hence, accounts that can use DES to authenticate to services are at significantly greater risk of having that account’s logon sequence decrypted and the account compromised.'>Use Kerberos DES</th>"
+Add-Content $report "                       <th width='10%' align='center' title='Accounts with Kerberos pre-authentication disabled (DONT_REQUIRE_PREAUTH) allow any authenticated (or in some cases unauthenticated) user to request an AS-REP message for them and attempt to crack the encrypted reply offline (AS-REP Roasting). This should be enabled only when strictly required.'>AS-REP Roastable</th>"
+Add-Content $report "                       <th width='10%' align='center' title='User accounts flagged as Trusted for Delegation (unconstrained delegation) allow any service running as that account to impersonate any user, including Domain Admins, against any other service in the domain. This should generally never be set on user/service accounts.'>Unconstrained Delegation</th>"
+Add-Content $report "                   </tr>"
 
 Foreach ($Domain in $Global:DomainNames)
     {
@@ -1327,6 +1365,8 @@ Foreach ($Domain in $Global:DomainNames)
                 $UsersReversePWD = ($Usrs.Users | Where-Object {$_.Name -eq 7}).Count
                 $UsersPWDNotReq = ($Usrs.Users | Where-Object {$_.Name -eq 5}).Count
                 $UsersPWDNeverExpire = ($Usrs.Users | Where-Object {$_.Name -eq 16}).Count
+                $UsersASREPRoastable = ($Usrs.Users | Where-Object {$_.Name -eq 22}).Count
+                $UsersUnconstrainedDeleg = ($Usrs.Users | Where-Object {$_.Name -eq 19}).Count
 
                 Write-Host ('Analyzing and Reporting: ') -NoNewline
                 Write-Host $AllUsers -NoNewline -ForegroundColor Magenta
@@ -1367,13 +1407,31 @@ Foreach ($Domain in $Global:DomainNames)
                     { 
                         Add-Content $report "                   <td bgcolor= $TableMeadiumColor align=center>$UsersPWDNeverExpire</td>" 
                     }
-                if ($UsersDES -eq 0) 
+                if ($UsersDES -eq 0)
                     {
                         Add-Content $report "                   <td bgcolor= $TableSuccessColor align=center>0</td>"
                     }
-                else 
-                    { 
-                        Add-Content $report "                   <td bgcolor= $TableMeadiumColor align=center>$UsersDES</td>" 
+                else
+                    {
+                        Add-Content $report "                   <td bgcolor= $TableMeadiumColor align=center>$UsersDES</td>"
+                    }
+
+                if ($UsersASREPRoastable -eq 0)
+                    {
+                        Add-Content $report "                   <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                   <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>$UsersASREPRoastable</font></td>"
+                    }
+
+                if ($UsersUnconstrainedDeleg -eq 0)
+                    {
+                        Add-Content $report "                   <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                   <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>$UsersUnconstrainedDeleg</font></td>"
                     }
 
                 Add-Content $report "</tr>"
@@ -1390,7 +1448,7 @@ Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Use
 Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - End of User Account phase.")
 
 Add-Content $report "               </table>" 
-Add-Content $report "               <p class='note'>This overview state of user accounts will present the <strong>Total number of users</strong>, as so as the total number of <strong>Disabled User Accounts</strong>, <strong>Accounts storing password with Reversible Encryption</strong>, <strong>Accounts checked with password not required</strong>, <strong>Accounts using Kerberos DES encryption</strong> and User Accounts that have the <strong>'Password Never Expires'</strong> option set. According to <a href='https://docs.microsoft.com/en-us/azure-advanced-threat-protection/atp-cas-isp-unsecure-account-attributes' target='_blank' rel='external'>Security assessment: Unsecure account attributes</a> those counters should be <strong>0</strong> or the smallest as possible. Exceptions may apply, but should not be a common practice.</p>" 
+Add-Content $report "               <p class='note'>This overview state of user accounts will present the <strong>Total number of users</strong>, as so as the total number of <strong>Disabled User Accounts</strong>, <strong>Accounts storing password with Reversible Encryption</strong>, <strong>Accounts checked with password not required</strong>, <strong>Accounts using Kerberos DES encryption</strong>, User Accounts that have the <strong>'Password Never Expires'</strong> option set, accounts vulnerable to <strong>AS-REP Roasting</strong> (Kerberos pre-authentication disabled) and accounts configured for <strong>Unconstrained Delegation</strong>. According to <a href='https://docs.microsoft.com/en-us/azure-advanced-threat-protection/atp-cas-isp-unsecure-account-attributes' target='_blank' rel='external'>Security assessment: Unsecure account attributes</a> those counters should be <strong>0</strong> or the smallest as possible. Exceptions may apply, but should not be a common practice.</p>"
 Add-Content $report "           </CENTER>"
 
 
@@ -2805,6 +2863,218 @@ Add-Content $report "           <section>"
 Add-Content $report "               <h2>Domain Controller's Security<hr></h2>" 
 Add-Content $report "               <p>This section will give a detailed view of the Domain Controller's Security. This inventory is based on Microsoft´s best practices and recommendations.</p>" 
 Add-Content $report "           </section>"
+
+#---------------------------------------------------------------------------------------------------[AD Identity and Kerberos Security]--------------------------------------------------------
+
+Write-Host 'Reporting Active Directory Identity and Kerberos Security..'
+
+Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Begining Identity and Kerberos Security Reporting.")
+
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <h3>Identity &amp; Kerberos Security ($Forest)</h3>"
+Add-Content $report "           </CENTER>"
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <table width='95%' border='1'>"
+Add-Content $report "                   <tr>"
+Add-Content $report "                       <th width='10%' align='center'>Domain</th>"
+Add-Content $report "                       <th width='11%' align='center' title='Members of the built-in Protected Users group get additional Kerberos-based protections (no NTLM, no DES/RC4, no delegation, no long-lived TGTs). Microsoft recommends adding Tier 0 administrative accounts to this group where operationally feasible.'>Protected Users Members</th>"
+Add-Content $report "                       <th width='12%' align='center' title='Enabled user accounts with a Service Principal Name (SPN) can have a Kerberos service ticket requested for them by any authenticated user and attacked offline to recover the account password (Kerberoasting).'>Kerberoastable Accounts</th>"
+Add-Content $report "                       <th width='12%' align='center' title='Kerberoastable accounts whose password has not been changed in over a year are at significantly higher risk, as an offline cracking attempt has more time and more incentive to succeed.'>Kerberoastable, Password &gt;1yr</th>"
+Add-Content $report "                       <th width='12%' align='center' title='Of the Kerberoastable accounts, those that still permit RC4-HMAC Kerberos encryption (or have no msDS-SupportedEncryptionTypes value set, which defaults to allowing RC4) are far cheaper to crack offline than AES-only accounts once a service ticket is captured.'>Kerberoastable Using RC4</th>"
+Add-Content $report "                       <th width='12%' align='center' title='Accounts with adminCount=1 but that are no longer members of a protected group are AdminSDHolder orphans. They keep an inherited restrictive ACL and were historically privileged, but are easy to overlook during access reviews.'>AdminSDHolder Orphans</th>"
+Add-Content $report "                       <th width='13%' align='center' title='Computer accounts trusted for unconstrained delegation (excluding Domain Controllers) can cache and replay the Kerberos TGT of any user that authenticates to them, including Domain Admins. This should be avoided in favor of constrained or resource-based constrained delegation.'>Unconstrained Delegation (Computers)</th>"
+Add-Content $report "                       <th width='10%' align='center' title='The krbtgt account signs and encrypts all Kerberos tickets in the domain. Microsoft recommends resetting its password at least every 180 days (and twice, several hours apart, after any suspected compromise).'>KRBTGT Password Age (Days)</th>"
+Add-Content $report "                   </tr>"
+
+Foreach ($Domain in $Global:DomainNames)
+    {
+        Try
+            {
+                $IdSec = Import-Clixml -Path ('C:\ADxRay\Hammer\Domain_'+$Domain+'.xml')
+
+                $ProtectedUsersCount = $IdSec.AdminGroups.'Protected Users'
+                if ([string]::IsNullOrEmpty($ProtectedUsersCount)) {$ProtectedUsersCount = 0}
+
+                $KerbRoastCount = ($IdSec.Kerberoastable | Measure-Object).Count
+                $KerbRoastOldPwd = ($IdSec.Kerberoastable | Where-Object {$_.PasswordLastSet -lt (Get-Date).AddDays(-365)} | Measure-Object).Count
+                $KerbRoastRC4 = ($IdSec.Kerberoastable | Where-Object {[string]::IsNullOrEmpty($_.SupportedEncryptionTypes) -or ($_.SupportedEncryptionTypes -band 4)} | Measure-Object).Count
+                $AdminSDOrphanCount = ($IdSec.AdminSDHolderOrphans | Measure-Object).Count
+                $UnconDelegCount = ($IdSec.UnconstrainedDelegationComputers | Measure-Object).Count
+
+                if ([string]::IsNullOrEmpty($IdSec.KrbtgtPasswordLastSet))
+                    {
+                        $KrbtgtAgeDays = 'N/A'
+                    }
+                else
+                    {
+                        $KrbtgtAgeDays = [math]::Round(((Get-Date) - $IdSec.KrbtgtPasswordLastSet).TotalDays)
+                    }
+
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Domain: "+$Domain+" - Kerberoastable: "+$KerbRoastCount+" - AdminSDHolder Orphans: "+$AdminSDOrphanCount+" - Unconstrained Delegation Computers: "+$UnconDelegCount+" - KRBTGT Age (Days): "+$KrbtgtAgeDays)
+
+                Add-Content $report "                   <tr>"
+                Add-Content $report "                       <td align=center>$Domain</td>"
+
+                if ($ProtectedUsersCount -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>$ProtectedUsersCount</td>"
+                    }
+
+                if ($KerbRoastCount -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>$KerbRoastCount</td>"
+                    }
+
+                if ($KerbRoastOldPwd -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>$KerbRoastOldPwd</font></td>"
+                    }
+
+                if ($KerbRoastRC4 -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>$KerbRoastRC4</font></td>"
+                    }
+
+                if ($AdminSDOrphanCount -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>$AdminSDOrphanCount</td>"
+                    }
+
+                if ($UnconDelegCount -eq 0)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>0</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>$UnconDelegCount</font></td>"
+                    }
+
+                if ($KrbtgtAgeDays -eq 'N/A')
+                    {
+                        Add-Content $report "                       <td align=center>N/A</td>"
+                    }
+                elseif ($KrbtgtAgeDays -le 180)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>$KrbtgtAgeDays</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>$KrbtgtAgeDays</td>"
+                    }
+
+                Add-Content $report "                   </tr>"
+            }
+        Catch
+            {
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - ------------- Errors were found  -------------")
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred during reporting: "+$_.Exception.Message)
+            }
+    }
+
+Add-Content $report "               </table>"
+Add-Content $report "           </CENTER>"
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <p class='note'>Kerberoasting and AS-REP Roasting are offline password-cracking techniques that target Kerberos tickets rather than the domain's authentication endpoints, so they are not blocked by account lockout policies. Accounts still permitting RC4-HMAC encryption (including any account with no msDS-SupportedEncryptionTypes value configured, which defaults to allowing RC4) are dramatically faster to crack offline than AES-only accounts once a ticket is captured. Review <a href='https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/attractive-accounts-for-credential-theft' target='_blank' rel='external'>Attractive Accounts for Credential Theft</a>, <a href='https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory' target='_blank' rel='external'>Protected Accounts and Groups in Active Directory</a> (AdminSDHolder), <a href='https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-delegation' target='_blank' rel='external'>Understanding Kerberos Delegation</a> and <a href='https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/component-updates/kerberos-krbtgt-account-password-reset' target='_blank' rel='external'>AD Forest Recovery - Resetting the krbtgt password</a> for remediation guidance.</p>"
+Add-Content $report "           </CENTER>"
+
+
+#---------------------------------------------------------------------------------------------------[DC LDAP Signing and Channel Binding]--------------------------------------------------------
+
+Write-Host 'Reporting Domain Controllers LDAP Signing and Channel Binding..'
+
+Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Begining LDAP Signing and Channel Binding Reporting.")
+
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <h3>LDAP Signing &amp; Channel Binding ($Forest)</h3>"
+Add-Content $report "           </CENTER>"
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <table width='70%' border='1'>"
+Add-Content $report "                   <tr>"
+Add-Content $report "                       <th width='10%' align='center'>Domain</th>"
+Add-Content $report "                       <th width='15%' align='center'>Domain Controller</th>"
+Add-Content $report "                       <th width='20%' align='center' title='LDAPServerIntegrity controls whether the LDAP server requires signing of incoming LDAP binds. Unsigned LDAP binds are vulnerable to relay and tampering attacks. Recommended value: Required.'>LDAP Server Signing</th>"
+Add-Content $report "                       <th width='20%' align='center' title='LdapEnforceChannelBinding controls whether LDAP binds over SSL/TLS are required to include a channel binding token, protecting against LDAP relay attacks. Recommended value: Always (2), minimum: When Supported (1).'>LDAP Channel Binding</th>"
+Add-Content $report "                   </tr>"
+
+foreach ($DC in $Global:DCs)
+    {
+        Try
+            {
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Begining LDAP Security Reporting of:"+$DC)
+
+                $DCD = Import-Clixml -Path ('C:\ADxRay\Hammer\Inv_'+$DC+'.xml')
+
+                $Domain = $DCD.Domain
+                $DCHostName = $DC
+
+                $LdapSigning = $DCD.LdapSecurity.LDAPServerIntegrity
+                $LdapChannelBinding = $DCD.LdapSecurity.LdapEnforceChannelBinding
+
+                Add-Content $report "                   <tr>"
+                Add-Content $report "                       <td align=center>$Domain</td>"
+                Add-Content $report "                       <td align=center>$DCHostname</td>"
+
+                if ($LdapSigning -eq 2)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>Required</td>"
+                    }
+                elseif ($LdapSigning -eq 1)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>Negotiated (Not Required)</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>Not Configured / Unknown</font></td>"
+                    }
+
+                if ($LdapChannelBinding -eq 2)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableSuccessColor align=center>Always</td>"
+                    }
+                elseif ($LdapChannelBinding -eq 1)
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableMeadiumColor align=center>When Supported</td>"
+                    }
+                else
+                    {
+                        Add-Content $report "                       <td bgcolor= $TableErrorColor align=center><font color=$TableFontOnError>Never / Not Configured</font></td>"
+                    }
+
+                Add-Content $report "                   </tr>"
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - End of LDAP Security Reporting for server:"+$DC)
+            }
+        Catch
+            {
+                Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred during reporting: "+$_.Exception.Message)
+            }
+    }
+
+Add-Content $report "               </table>"
+Add-Content $report "           </CENTER>"
+Add-Content $report "           <CENTER>"
+Add-Content $report "               <p class='note'>Unsigned and unbound LDAP traffic can be relayed or tampered with by an on-path attacker. Microsoft recommends enforcing LDAP signing and channel binding on all Domain Controllers. Review <a href='https://support.microsoft.com/en-us/topic/2020-2023-and-2024-ldap-channel-binding-and-ldap-signing-requirements-for-windows-ef185fb8-00f7-167d-744c-f299a66fc00a' target='_blank' rel='external'>2020-2024 LDAP channel binding and LDAP signing requirements for Windows</a> before enabling enforcement, as clients or applications relying on unsigned/unbound LDAP will stop functioning.</p>"
+Add-Content $report "           </CENTER>"
+
 
 #---------------------------------------------------------------------------------------------------[DC Security log Inventory]--------------------------------------------------------
 
