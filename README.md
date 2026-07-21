@@ -68,7 +68,7 @@ Note: three sections (GPO Objects overview, Domain Controllers Security Group Po
 
 ### SOC / SIEM / XDR integration:
 
-Every run automatically exports the seven security checks above as standardized findings to `C:\ADxRay\ADxRay_Findings_<timestamp>.json` and `.csv` (schema: `Id`, `Category`, `SubCategory`, `Title`, `Severity`, `Status`, `Scope`, `AffectedCount`, `Description`, `Recommendation`, `Timestamp`). This is a local file only - no network activity - and any SIEM's file/log collector can ingest it directly.
+Every run automatically exports the seven security checks above as standardized findings to `C:\ADxRay\ADxRay_Findings_<timestamp>.json` and `.csv` (schema: `Id`, `Category`, `SubCategory`, `Title`, `Severity`, `Status`, `Scope`, `AffectedCount`, `Description`, `Recommendation`, `Timestamp`). This is a local file only - no network activity - and any SIEM's file/log collector can ingest it directly. See [`samples/ADxRay_Sample_Findings.json`](samples/ADxRay_Sample_Findings.json) / [`.csv`](samples/ADxRay_Sample_Findings.csv) for an example generated from the demo data above.
 
 Two additional delivery mechanisms are available, both **opt-in** (off by default, so existing behavior is unchanged unless you ask for them):
 
