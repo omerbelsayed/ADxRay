@@ -1,5 +1,7 @@
 ## Active Directory xRay Script
 
+_This fork is maintained by [Omer Elsayed](https://github.com/omerbelsayed), based on the original project by Claudio Merola and Raphaela Pereira. Distributed under the original project's GPL-3.0 license._
+
 The script does not record, create or modify anything in the environment (except for creating a folder named “ADxRay” in C:\ of the computer running the script. Inside that folder the log files and the main report file named “ADxRay_Report(YEAR-MONTH-DAY).htm” is created). 
 
 The script must be run at a Domain Controller running at least Windows Server 2012 (see requirements below). 
@@ -61,6 +63,29 @@ You don't need a live Active Directory environment to see what the report looks 
 A pre-generated example is included at [`samples/ADxRay_Sample_Report.htm`](samples/ADxRay_Sample_Report.htm) - download it and open it in a browser to see the report without running anything.
 
 Note: three sections (GPO Objects overview, Domain Controllers Security Group Policies, and User Rights Assignments) parse raw `Get-GPOReport`/RSoP XML from a live environment and are not populated by the demo generator; every other section, including all seven new security checks, renders with realistic data.
+
+<BR/>
+
+### SOC / SIEM / XDR integration:
+
+Every run automatically exports the seven security checks above as standardized findings to `C:\ADxRay\ADxRay_Findings_<timestamp>.json` and `.csv` (schema: `Id`, `Category`, `SubCategory`, `Title`, `Severity`, `Status`, `Scope`, `AffectedCount`, `Description`, `Recommendation`, `Timestamp`). This is a local file only - no network activity - and any SIEM's file/log collector can ingest it directly.
+
+Two additional delivery mechanisms are available, both **opt-in** (off by default, so existing behavior is unchanged unless you ask for them):
+
+```powershell
+# Write Fail-status findings to the local Windows Application Event Log (Source: ADxRay, Event IDs 6001-6009).
+# Requires local Administrator rights to register the event source on first run.
+# Picked up automatically by whatever SIEM/XDR agent already collects Windows Event Logs on the DC
+# (Sentinel AMA, Splunk Universal Forwarder, QRadar WinCollect, Defender, CrowdStrike, etc.) - no vendor-specific code needed.
+.\ADxRay.ps1 -WriteSecurityEventLog
+
+# Push Fail-status findings as a JSON payload to any HTTP(S) endpoint (a generic webhook receiver,
+# Splunk HEC, a Sentinel Logic App HTTP trigger, etc.). This is the only network call the script makes,
+# and only runs if -WebhookUrl is explicitly provided.
+.\ADxRay.ps1 -WebhookUrl "https://your-siem.example.com/ingest" -WebhookToken "your-bearer-token"
+```
+
+Both flags can be combined with any of the six menu options above. Failures in either mechanism (e.g. missing Administrator rights, an unreachable webhook) are logged to `ADxRay.log` and do not interrupt report generation.
 
 <BR/>
 
