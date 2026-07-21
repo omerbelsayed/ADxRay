@@ -18,11 +18,19 @@ Author:         Claudio Merola
 Co-Author:      Raphaela Pereira
 Date:           02/28/2024
 
+Fork Maintainer: Omer Elsayed (https://github.com/omerbelsayed/ADxRay)
+Fork Notes:      Adds read-only Kerberos/identity security checks (LDAP signing and channel binding,
+                 Kerberoasting, AS-REP roasting, RC4 exposure, unconstrained delegation, KRBTGT age,
+                 AdminSDHolder orphans, Protected Users adoption) and optional SOC/SIEM/XDR findings
+                 export (JSON/CSV, Windows Event Log, webhook). Distributed under the original
+                 project's GPL-3.0 license; original authorship above is preserved as required by
+                 that license.
+
 #>
 
 #---------------------------------------------------------[First Variables]--------------------------------------------------------
 
-param ($Clear,$JobTimeout=180)
+param ($Clear,$JobTimeout=180,[switch]$WriteSecurityEventLog,[string]$WebhookUrl,[string]$WebhookToken)
 
 Write-Host 'Starting ADxRay Script..' -ForegroundColor Green
 
@@ -678,6 +686,226 @@ function Hammer
 }
 
 #-----------------------------------------[End of Hammer]---------------------------------------------------
+
+
+
+#----------------------------------------[Begin of Export-SecurityFindings]---------------------------------------------------
+
+function Export-SecurityFindings {
+
+    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Starting Security Findings Export")
+
+    $Findings = @()
+    $EventIdMap = @{
+        'AD-SEC-LDAPSIGN'         = 6001
+        'AD-SEC-LDAPCHANBIND'     = 6002
+        'AD-KERB-ROAST'           = 6003
+        'AD-KERB-ROAST-RC4'       = 6004
+        'AD-KERB-ASREP'           = 6005
+        'AD-KERB-UNCONSTRAINED'   = 6006
+        'AD-IDENTITY-KRBTGT-AGE'  = 6007
+        'AD-IDENTITY-ADMINSDHOLDER' = 6008
+        'AD-IDENTITY-PROTECTEDUSERS' = 6009
+    }
+
+    Foreach ($Domain in $Global:DomainNames)
+        {
+            Try
+                {
+                    $DomData = Import-Clixml -Path ('C:\ADxRay\Hammer\Domain_'+$Domain+'.xml')
+
+                    $ProtectedUsersCount = $DomData.AdminGroups.'Protected Users'
+                    if ([string]::IsNullOrEmpty($ProtectedUsersCount)) {$ProtectedUsersCount = 0}
+
+                    $KerbRoastCount = ($DomData.Kerberoastable | Measure-Object).Count
+                    $KerbRoastRC4 = ($DomData.Kerberoastable | Where-Object {[string]::IsNullOrEmpty($_.SupportedEncryptionTypes) -or ($_.SupportedEncryptionTypes -band 4)} | Measure-Object).Count
+                    $AsRepRoastCount = ($DomData.Users | Where-Object {$_.Name -eq 22}).Count
+                    $UnconstrainedUserCount = ($DomData.Users | Where-Object {$_.Name -eq 19}).Count
+                    $UnconstrainedComputerCount = ($DomData.UnconstrainedDelegationComputers | Measure-Object).Count
+                    $UnconstrainedTotal = $UnconstrainedUserCount + $UnconstrainedComputerCount
+                    $AdminSDOrphanCount = ($DomData.AdminSDHolderOrphans | Measure-Object).Count
+
+                    if ([string]::IsNullOrEmpty($DomData.KrbtgtPasswordLastSet))
+                        { $KrbtgtAgeDays = $null }
+                    else
+                        { $KrbtgtAgeDays = [math]::Round(((Get-Date) - $DomData.KrbtgtPasswordLastSet).TotalDays) }
+
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-KERB-ROAST'; Category = 'Security'; SubCategory = 'Kerberos'; Title = 'Kerberoastable Accounts'
+                        Severity = if ($KerbRoastCount -gt 0) {'High'} else {'Pass'}; Status = if ($KerbRoastCount -gt 0) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $KerbRoastCount
+                        Description = 'Enabled user accounts with a Service Principal Name (SPN) can have a Kerberos service ticket requested and cracked offline (Kerberoasting).'
+                        Recommendation = 'Use Group Managed Service Accounts (gMSA) or enforce AES-only, long/random passwords for service accounts.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-KERB-ROAST-RC4'; Category = 'Security'; SubCategory = 'Kerberos'; Title = 'Kerberoastable Accounts Permitting RC4'
+                        Severity = if ($KerbRoastRC4 -gt 0) {'Critical'} else {'Pass'}; Status = if ($KerbRoastRC4 -gt 0) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $KerbRoastRC4
+                        Description = 'Kerberoastable accounts still permitting RC4-HMAC encryption are dramatically faster to crack offline than AES-only accounts.'
+                        Recommendation = 'Set msDS-SupportedEncryptionTypes to AES-only (24) on all service accounts.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-KERB-ASREP'; Category = 'Security'; SubCategory = 'Kerberos'; Title = 'AS-REP Roastable Accounts'
+                        Severity = if ($AsRepRoastCount -gt 0) {'High'} else {'Pass'}; Status = if ($AsRepRoastCount -gt 0) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $AsRepRoastCount
+                        Description = 'Accounts with Kerberos pre-authentication disabled allow an AS-REP message to be requested and cracked offline.'
+                        Recommendation = 'Enable Kerberos pre-authentication on all accounts unless a specific, documented exception applies.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-KERB-UNCONSTRAINED'; Category = 'Security'; SubCategory = 'Kerberos'; Title = 'Unconstrained Kerberos Delegation'
+                        Severity = if ($UnconstrainedTotal -gt 0) {'Critical'} else {'Pass'}; Status = if ($UnconstrainedTotal -gt 0) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $UnconstrainedTotal
+                        Description = 'Accounts/computers trusted for unconstrained delegation can cache and replay the Kerberos TGT of any user that authenticates to them.'
+                        Recommendation = 'Migrate to constrained delegation or Resource-Based Constrained Delegation (RBCD); remove unconstrained delegation unless strictly required.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-IDENTITY-KRBTGT-AGE'; Category = 'Security'; SubCategory = 'Identity'; Title = 'KRBTGT Password Age'
+                        Severity = if ($null -eq $KrbtgtAgeDays) {'Medium'} elseif ($KrbtgtAgeDays -gt 365) {'Critical'} elseif ($KrbtgtAgeDays -gt 180) {'High'} else {'Pass'}
+                        Status = if ($null -eq $KrbtgtAgeDays -or $KrbtgtAgeDays -gt 180) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = 1
+                        Description = 'The krbtgt account signs and encrypts all Kerberos tickets in the domain and should be rotated regularly.'
+                        Recommendation = 'Reset the krbtgt password (twice, several hours apart, following the documented procedure) at least every 180 days.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-IDENTITY-ADMINSDHOLDER'; Category = 'Security'; SubCategory = 'Identity'; Title = 'AdminSDHolder Orphaned Accounts'
+                        Severity = if ($AdminSDOrphanCount -gt 0) {'Medium'} else {'Pass'}; Status = if ($AdminSDOrphanCount -gt 0) {'Fail'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $AdminSDOrphanCount
+                        Description = 'Accounts with adminCount=1 that are no longer members of a protected group keep an inherited restrictive ACL and are easy to overlook during access reviews.'
+                        Recommendation = 'Review and, where appropriate, reset adminCount and restore ACL inheritance on these accounts.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-IDENTITY-PROTECTEDUSERS'; Category = 'Security'; SubCategory = 'Identity'; Title = 'Protected Users Group Adoption'
+                        Severity = if ($ProtectedUsersCount -eq 0) {'Low'} else {'Pass'}; Status = if ($ProtectedUsersCount -eq 0) {'Warning'} else {'Pass'}
+                        Scope = $Domain; AffectedCount = $ProtectedUsersCount
+                        Description = 'The built-in Protected Users group provides additional Kerberos-based protections for Tier 0 administrative accounts.'
+                        Recommendation = 'Evaluate adding Tier 0 administrative accounts to the Protected Users group where operationally feasible.'
+                        Timestamp = (Get-Date)
+                    }
+                }
+            Catch
+                {
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred during Security Findings Export (Domain "+$Domain+"): "+$_.Exception.Message)
+                }
+        }
+
+    foreach ($DC in $Global:DCs)
+        {
+            Try
+                {
+                    $DcData = Import-Clixml -Path ('C:\ADxRay\Hammer\Inv_'+$DC+'.xml')
+
+                    $LdapSigning = $DcData.LdapSecurity.LDAPServerIntegrity
+                    $LdapChannelBinding = $DcData.LdapSecurity.LdapEnforceChannelBinding
+
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-SEC-LDAPSIGN'; Category = 'Security'; SubCategory = 'LDAP'; Title = 'LDAP Server Signing'
+                        Severity = if ($LdapSigning -eq 2) {'Pass'} elseif ($LdapSigning -eq 1) {'Medium'} else {'High'}
+                        Status = if ($LdapSigning -eq 2) {'Pass'} else {'Fail'}
+                        Scope = $DC; AffectedCount = 1
+                        Description = 'LDAPServerIntegrity controls whether the LDAP server requires signing of incoming LDAP binds.'
+                        Recommendation = 'Set LDAPServerIntegrity to 2 (Required) on all Domain Controllers.'
+                        Timestamp = (Get-Date)
+                    }
+                    $Findings += [PSCustomObject]@{
+                        Id = 'AD-SEC-LDAPCHANBIND'; Category = 'Security'; SubCategory = 'LDAP'; Title = 'LDAP Channel Binding'
+                        Severity = if ($LdapChannelBinding -eq 2) {'Pass'} elseif ($LdapChannelBinding -eq 1) {'Medium'} else {'Critical'}
+                        Status = if ($LdapChannelBinding -eq 2) {'Pass'} else {'Fail'}
+                        Scope = $DC; AffectedCount = 1
+                        Description = 'LdapEnforceChannelBinding controls whether LDAP binds over SSL/TLS require a channel binding token, protecting against LDAP relay attacks.'
+                        Recommendation = 'Set LdapEnforceChannelBinding to 2 (Always) on all Domain Controllers.'
+                        Timestamp = (Get-Date)
+                    }
+                }
+            Catch
+                {
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred during Security Findings Export (DC "+$DC+"): "+$_.Exception.Message)
+                }
+        }
+
+    # ---- JSON / CSV export (always produced - local files only, no network activity) ----
+    $FindingsBase = ('C:\ADxRay\ADxRay_Findings_'+(get-date -Format 'yyyy-MM-dd-hh-mm'))
+
+    $ExportPayload = [PSCustomObject]@{
+        Tool      = 'ADxRay'
+        Version   = $Global:Ver
+        GeneratedOn = (Get-Date)
+        Findings  = $Findings
+    }
+
+    Try
+        {
+            $ExportPayload | ConvertTo-Json -Depth 6 | Out-File -FilePath ($FindingsBase+'.json') -Encoding UTF8
+            $Findings | Select-Object Id,Category,SubCategory,Title,Severity,Status,Scope,AffectedCount,Description,Recommendation,Timestamp | Export-Csv -Path ($FindingsBase+'.csv') -NoTypeInformation -Encoding UTF8
+            Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Security findings exported: "+$FindingsBase+".json / .csv")
+        }
+    Catch
+        {
+            Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred exporting Security Findings JSON/CSV: "+$_.Exception.Message)
+        }
+
+    $AlertableFindings = $Findings | Where-Object {$_.Status -eq 'Fail'}
+
+    # ---- Windows Event Log (opt-in via -WriteSecurityEventLog; local write only, consumed by whatever SIEM/XDR agent already collects Windows Event Logs on this DC) ----
+    if ($WriteSecurityEventLog)
+        {
+            Try
+                {
+                    if (-not [System.Diagnostics.EventLog]::SourceExists('ADxRay'))
+                        {
+                            New-EventLog -LogName Application -Source 'ADxRay' -ErrorAction Stop
+                        }
+
+                    foreach ($Finding in $AlertableFindings)
+                        {
+                            $EntryType = switch ($Finding.Severity) { 'Critical' {'Error'} 'High' {'Error'} 'Medium' {'Warning'} default {'Warning'} }
+                            $EventId = $EventIdMap[$Finding.Id]
+                            if (-not $EventId) { $EventId = 6000 }
+
+                            $Message = "ADxRay Security Finding`nId: $($Finding.Id)`nTitle: $($Finding.Title)`nSeverity: $($Finding.Severity)`nScope: $($Finding.Scope)`nAffectedCount: $($Finding.AffectedCount)`nDescription: $($Finding.Description)`nRecommendation: $($Finding.Recommendation)"
+
+                            Write-EventLog -LogName Application -Source 'ADxRay' -EntryType $EntryType -EventId $EventId -Message $Message -ErrorAction Stop
+                        }
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Wrote "+$AlertableFindings.Count+" security findings to the Windows Application Event Log (Source: ADxRay)")
+                }
+            Catch
+                {
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred writing to the Windows Event Log (requires local Administrator rights to register a new Event Source): "+$_.Exception.Message)
+                }
+        }
+
+    # ---- Generic webhook push (opt-in via -WebhookUrl; the only network call in this script, and only runs if explicitly configured) ----
+    if (-not [string]::IsNullOrEmpty($WebhookUrl))
+        {
+            Try
+                {
+                    $WebhookPayload = [PSCustomObject]@{
+                        Tool         = 'ADxRay'
+                        Version      = $Global:Ver
+                        GeneratedOn  = (Get-Date)
+                        FindingCount = $AlertableFindings.Count
+                        Findings     = $AlertableFindings
+                    } | ConvertTo-Json -Depth 6
+
+                    $Headers = @{ 'Content-Type' = 'application/json' }
+                    if (-not [string]::IsNullOrEmpty($WebhookToken)) { $Headers['Authorization'] = 'Bearer '+$WebhookToken }
+
+                    Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $WebhookPayload -Headers $Headers -TimeoutSec 30 -ErrorAction Stop | Out-Null
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Info - Pushed "+$AlertableFindings.Count+" security findings to webhook: "+$WebhookUrl)
+                }
+            Catch
+                {
+                    Add-Content $ADxRayLog ((get-date -Format 'MM-dd-yyyy  HH:mm:ss')+" - Err - The following error ocurred pushing findings to the configured webhook (report generation is unaffected): "+$_.Exception.Message)
+                }
+        }
+}
+
+#----------------------------------------[End of Export-SecurityFindings]---------------------------------------------------
 
 
 
@@ -4092,6 +4320,7 @@ if($Global:Option -eq 1 -or $Global:Option -eq 2 -or $Global:Option -eq 3 -or $G
 
         Start-Sleep 10
         Report
+        Export-SecurityFindings
     }
 elseif($Global:Option -eq 5)
     {
@@ -4121,6 +4350,7 @@ elseif($Global:Option -eq 6)
                 $Global:DCs += $DC.Name.replace('Inv_','').replace('.xml','')
             }
         Report
+        Export-SecurityFindings
     }
 
 
